@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Camera</string>
+    <key>CFBundleDisplayName</key>
+    <string>Camera</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.local.Camera</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>Camera</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Camera needs access to your camera to capture photos and video.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Camera needs microphone access for video recording.</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>Camera saves photos to your Photos library and shows your most recent photo.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>Camera needs permission to save captured photos to your Photos library.</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.photography</string>
+</dict>
+</plist>
