@@ -96,6 +96,18 @@ struct ContentView: View {
 
     private var topBar: some View {
         HStack(spacing: 12) {
+            // Flash toggle — hidden when no flash is possible (e.g. phone front camera)
+            if camera.flashCapability != .none {
+                Button { camera.flashEnabled.toggle() } label: {
+                    ToolbarPill(
+                        icon: camera.flashEnabled ? "bolt.fill" : "bolt.slash",
+                        text: "Flash",
+                        active: camera.flashEnabled
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+
             // Mirror / flip button
             Button { camera.toggleMirror() } label: {
                 ToolbarPill(
@@ -431,7 +443,26 @@ struct ContentView: View {
     private func fire() {
         if camera.currentMode.isVideoMode {
             camera.startRecording()
+        } else if camera.flashEnabled && camera.flashCapability == .torch {
+            // Hardware torch flash (e.g. iPhone back camera via Continuity Camera)
+            camera.activateTorch()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                self.camera.capturePhoto {
+                    self.camera.deactivateTorch()
+                }
+            }
+        } else if camera.flashEnabled && camera.flashCapability == .screen {
+            // Screen flash: turn screen white to illuminate face (webcam)
+            withAnimation(.easeIn(duration: 0.05)) { showFlash = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                self.camera.capturePhoto {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        withAnimation(.easeOut(duration: 0.2)) { self.showFlash = false }
+                    }
+                }
+            }
         } else {
+            // No flash — quick visual feedback only
             withAnimation(.easeIn(duration: 0.04)) { showFlash = true }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
                 withAnimation(.easeOut(duration: 0.15)) { showFlash = false }

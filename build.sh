@@ -42,6 +42,8 @@ swiftc \
     -framework CoreMedia \
     -framework Combine \
     -framework Vision \
+    -framework CoreImage \
+    -framework CoreLocation \
     -parse-as-library \
     "${SWIFT_FILES[@]}"
 

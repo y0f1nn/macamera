@@ -33,6 +33,8 @@
     <string>Camera saves photos to your Photos library and shows your most recent photo.</string>
     <key>NSPhotoLibraryAddUsageDescription</key>
     <string>Camera needs permission to save captured photos to your Photos library.</string>
+    <key>NSLocationUsageDescription</key>
+    <string>Camera embeds location data in photos and videos.</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.photography</string>
 </dict>

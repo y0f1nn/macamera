@@ -5,7 +5,7 @@ enum CaptureMode: String, CaseIterable, Identifiable {
     case slowMotion = "Slo-Mo"
     case video      = "Video"
     case photo      = "Photo"
-    case hdr        = "HDR"
+    case hsdr       = "HSDR"
     case qrCode     = "QR"
 
     var id: String { rawValue }
@@ -13,7 +13,7 @@ enum CaptureMode: String, CaseIterable, Identifiable {
     var isVideoMode: Bool {
         switch self {
         case .video, .timelapse, .slowMotion: return true
-        case .photo, .hdr, .qrCode: return false
+        case .photo, .hsdr, .qrCode: return false
         }
     }
 
@@ -23,7 +23,7 @@ enum CaptureMode: String, CaseIterable, Identifiable {
         case .video:      return "video"
         case .timelapse:  return "timelapse"
         case .slowMotion: return "slowmo"
-        case .hdr:        return "camera.filters"
+        case .hsdr:       return "camera.filters"
         case .qrCode:     return "qrcode.viewfinder"
         }
     }

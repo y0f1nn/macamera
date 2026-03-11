@@ -2,6 +2,27 @@ import AVFoundation
 import AppKit
 import Photos
 import Vision
+import CoreImage
+import CoreLocation
+
+enum ImageFormat: String {
+    case png  = "png"
+    case heic = "heic"
+
+    var uti: CFString {
+        switch self {
+        case .png:  return "public.png" as CFString
+        case .heic: return "public.heic" as CFString
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .png:  return "PNG"
+        case .heic: return "HEIC"
+        }
+    }
+}
 
 /// Manages AVCaptureSession, photo/video capture, mirror, Center Stage,
 /// timelapse, slow-motion, night mode, and Photos library integration.
@@ -20,6 +41,27 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var centerStageAvailable = false
     @Published var centerStageActive = false
     @Published var photosAuthorized = false
+    @Published var flashEnabled = false
+
+    /// Flash capability of the active camera.
+    enum FlashCapability {
+        case torch       // Hardware torch (e.g. iPhone back camera)
+        case screen      // Screen-based flash (webcam)
+        case none        // No flash available (e.g. iPhone front camera)
+    }
+
+    var flashCapability: FlashCapability {
+        guard let device = activeCamera else { return .none }
+        if device.hasTorch && device.isTorchAvailable {
+            return .torch
+        }
+        // Front-facing phone camera with no torch — no flash
+        if device.position == .front {
+            return .none
+        }
+        // Webcam or unspecified position — use screen flash
+        return .screen
+    }
 
     // Mode & recording
     @Published var currentMode: CaptureMode = .photo
@@ -30,6 +72,16 @@ final class CameraManager: NSObject, ObservableObject {
     // QR code scanning
     @Published var detectedQRString: String?
     @Published var isQRScanning = false
+
+    /// Settings read from UserDefaults (set via Settings menu)
+    var imageFormat: ImageFormat {
+        ImageFormat(rawValue: UserDefaults.standard.string(forKey: "imageFormat") ?? "png") ?? .png
+    }
+    var exifCamera: Bool { UserDefaults.standard.object(forKey: "exifCamera") as? Bool ?? true }
+    var exifLens: Bool { UserDefaults.standard.object(forKey: "exifLens") as? Bool ?? true }
+    var exifLocation: Bool { UserDefaults.standard.object(forKey: "exifLocation") as? Bool ?? true }
+    var exifDateTime: Bool { UserDefaults.standard.object(forKey: "exifDateTime") as? Bool ?? true }
+    var exifSoftware: Bool { UserDefaults.standard.object(forKey: "exifSoftware") as? Bool ?? true }
 
     // MARK: - Internals
 
@@ -48,6 +100,15 @@ final class CameraManager: NSObject, ObservableObject {
     private var recordingStartTime: Date?
     private var modeAtRecordingStart: CaptureMode = .video
 
+    // Location
+    private let locationManager = CLLocationManager()
+    private var currentLocation: CLLocation?
+
+    // HSDR capture
+    private var isCapturingHSDR = false
+    private var hsdrCompletion: (() -> Void)?
+    private var hsdrShouldMirror = false
+
     // MARK: - Lifecycle
 
     override init() {
@@ -63,11 +124,15 @@ final class CameraManager: NSObject, ObservableObject {
             name: .AVCaptureDeviceWasDisconnected, object: nil
         )
         requestPhotosAccess()
+        locationManager.delegate = self
+        locationManager.desiredAccuracy = kCLLocationAccuracyBest
+        locationManager.requestWhenInUseAuthorization()
     }
 
     deinit {
         stopSession()
         PHPhotoLibrary.shared().unregisterChangeObserver(self)
+        locationManager.stopUpdatingLocation()
     }
 
     // MARK: - Photos Authorization
@@ -200,8 +265,8 @@ final class CameraManager: NSObject, ObservableObject {
         if isRecording { stopRecording() }
 
         // Reset device settings when leaving special modes
-        if currentMode == .hdr, let device = videoInput?.device {
-            sessionQueue.async { self.configureHDR(device: device, enabled: false) }
+        if currentMode == .hsdr, let device = videoInput?.device {
+            sessionQueue.async { self.configureHSDR(device: device, enabled: false) }
         }
         if currentMode == .qrCode {
             DispatchQueue.main.async {
@@ -225,7 +290,7 @@ final class CameraManager: NSObject, ObservableObject {
             }
 
             switch mode {
-            case .photo, .hdr:
+            case .photo, .hsdr:
                 self.session.sessionPreset = .photo
                 if self.session.canAddOutput(self.photoOutput) {
                     self.session.addOutput(self.photoOutput)
@@ -266,13 +331,13 @@ final class CameraManager: NSObject, ObservableObject {
         case .slowMotion:
             let maxFPS = maxAvailableFrameRate(for: device)
             configureFrameRate(device: device, targetFPS: maxFPS)
-            configureHDR(device: device, enabled: false)
-        case .hdr:
+            configureHSDR(device: device, enabled: false)
+        case .hsdr:
             resetFrameRate(device: device)
-            configureHDR(device: device, enabled: true)
+            configureHSDR(device: device, enabled: true)
         default:
             resetFrameRate(device: device)
-            configureHDR(device: device, enabled: false)
+            configureHSDR(device: device, enabled: false)
         }
     }
 
@@ -318,6 +383,30 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Torch (Hardware Flash)
+
+    func activateTorch() {
+        guard let device = activeCamera, device.hasTorch, device.isTorchAvailable else { return }
+        sessionQueue.async {
+            do {
+                try device.lockForConfiguration()
+                try device.setTorchModeOn(level: AVCaptureDevice.maxAvailableTorchLevel)
+                device.unlockForConfiguration()
+            } catch { }
+        }
+    }
+
+    func deactivateTorch() {
+        guard let device = activeCamera, device.hasTorch else { return }
+        sessionQueue.async {
+            do {
+                try device.lockForConfiguration()
+                device.torchMode = .off
+                device.unlockForConfiguration()
+            } catch { }
+        }
+    }
+
     // MARK: - Photo Capture
 
     func capturePhoto(completion: @escaping () -> Void) {
@@ -326,21 +415,92 @@ final class CameraManager: NSObject, ObservableObject {
             return
         }
         DispatchQueue.main.async { self.isCapturing = true }
-        captureCompletion = completion
-        mirrorAtCapture = isMirrored
+
+        if currentMode == .hsdr {
+            captureHSDRBracket(completion: completion)
+        } else {
+            captureCompletion = completion
+            mirrorAtCapture = isMirrored
+            let settings = AVCapturePhotoSettings()
+            photoOutput.capturePhoto(with: settings, delegate: self)
+        }
+    }
+
+    // MARK: - HSDR Capture (Direct CIFilter Pipeline)
+    //
+    // No virtual brackets or luminance masks — those approaches produce
+    // color fringing and glow on 8-bit webcam data. Instead, directly
+    // lift shadows, recover highlights, add local contrast, and tone map.
+
+    private func captureHSDRBracket(completion: @escaping () -> Void) {
+        isCapturingHSDR = true
+        hsdrCompletion = completion
+        hsdrShouldMirror = isMirrored
 
         let settings = AVCapturePhotoSettings()
-
-        // HDR mode: maximize photo quality for best tone mapping and dynamic range
-        if currentMode == .hdr {
-            if #available(macOS 13.0, *) {
-                settings.photoQualityPrioritization = .quality
-                // Use maximum photo dimensions for highest detail
-                settings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
-            }
+        if #available(macOS 13.0, *) {
+            settings.photoQualityPrioritization = .quality
+            settings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
         }
-
         photoOutput.capturePhoto(with: settings, delegate: self)
+    }
+
+    private func processHSDR(_ source: CGImage) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+
+            let ci = CIImage(cgImage: source)
+            let context = CIContext(options: [.workingColorSpace: CGColorSpaceCreateDeviceRGB()])
+
+            // HSDR for 8-bit webcam data — keep it clean and artifact-free.
+            // No unsharp mask (amplifies JPEG block artifacts in dark areas).
+
+            // 1. Lift shadows, recover highlights
+            var result = ci.applyingFilter("CIHighlightShadowAdjust", parameters: [
+                "inputShadowAmount": 0.4,
+                "inputHighlightAmount": 0.6
+            ])
+
+            // 2. Very mild S-curve for contrast
+            result = result.applyingFilter("CIToneCurve", parameters: [
+                "inputPoint0": CIVector(x: 0.0, y: 0.0),
+                "inputPoint1": CIVector(x: 0.25, y: 0.22),
+                "inputPoint2": CIVector(x: 0.5, y: 0.5),
+                "inputPoint3": CIVector(x: 0.75, y: 0.78),
+                "inputPoint4": CIVector(x: 1.0, y: 1.0)
+            ])
+
+            guard let outputCG = context.createCGImage(result, from: ci.extent) else {
+                self.failHSDR(); return
+            }
+
+            var finalImage = NSImage(
+                cgImage: outputCG,
+                size: NSSize(width: outputCG.width, height: outputCG.height)
+            )
+            if self.hsdrShouldMirror {
+                finalImage = self.mirrorImage(finalImage)
+            }
+
+            DispatchQueue.main.async {
+                self.capturedImage = finalImage
+                self.isCapturing = false
+                self.errorMessage = nil
+                self.hsdrCompletion?()
+                self.hsdrCompletion = nil
+            }
+
+            self.savePhotoToPhotosLibrary(finalImage)
+        }
+    }
+
+    private func failHSDR() {
+        DispatchQueue.main.async {
+            self.isCapturing = false
+            self.errorMessage = "HSDR processing failed."
+            self.hsdrCompletion?()
+            self.hsdrCompletion = nil
+        }
     }
 
     // MARK: - Video Recording
@@ -368,6 +528,7 @@ final class CameraManager: NSObject, ObservableObject {
             }
         }
 
+        movieOutput.metadata = buildVideoMetadata()
         movieOutput.startRecording(to: url, recordingDelegate: self)
 
         DispatchQueue.main.async {
@@ -419,7 +580,7 @@ final class CameraManager: NSObject, ObservableObject {
         recordingTimer = nil
     }
 
-    // MARK: - Save to Photos Library (Photo - HEIC)
+    // MARK: - Save to Photos Library (Photo)
 
     private func savePhotoToPhotosLibrary(_ image: NSImage) {
         guard photosAuthorized else { return }
@@ -428,21 +589,35 @@ final class CameraManager: NSObject, ObservableObject {
         ) else { return }
 
         let data = NSMutableData()
-        let heicType = "public.heic" as CFString
-        let jpegType = "public.jpeg" as CFString
-        let uti = CGImageDestinationCreateWithData(data, heicType, 1, nil) != nil
-            ? heicType : jpegType
+
+        let preferredUTI = imageFormat.uti
+        let fallbackUTI = "public.jpeg" as CFString
+
+        let uti: CFString
+        if CGImageDestinationCreateWithData(NSMutableData(), preferredUTI, 1, nil) != nil {
+            uti = preferredUTI
+        } else {
+            uti = fallbackUTI
+        }
 
         guard let dest = CGImageDestinationCreateWithData(data, uti, 1, nil) else { return }
-        let props: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.92]
+
+        var props = buildImageMetadata()
+        if uti != "public.png" as CFString {
+            props[kCGImageDestinationLossyCompressionQuality as String] = 0.95
+        }
+
         CGImageDestinationAddImage(dest, cgImage, props as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return }
+
+        let location = currentLocation
 
         PHPhotoLibrary.shared().performChanges {
             let request = PHAssetCreationRequest.forAsset()
             let options = PHAssetResourceCreationOptions()
             options.uniformTypeIdentifier = uti as String
             request.addResource(with: .photo, data: data as Data, options: options)
+            request.location = location
         } completionHandler: { [weak self] success, error in
             if success {
                 self?.fetchMostRecentAsset()
@@ -458,9 +633,11 @@ final class CameraManager: NSObject, ObservableObject {
 
     private func saveVideoToPhotosLibrary(_ url: URL) {
         guard photosAuthorized else { return }
+        let location = currentLocation
 
         PHPhotoLibrary.shared().performChanges {
-            PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+            let request = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+            request?.location = location
         } completionHandler: { [weak self] success, error in
             // Clean up temp file
             try? FileManager.default.removeItem(at: url)
@@ -658,14 +835,14 @@ final class CameraManager: NSObject, ObservableObject {
         } catch {}
     }
 
-    // MARK: - HDR Helpers
+    // MARK: - HSDR Helpers
 
-    private func configureHDR(device: AVCaptureDevice, enabled: Bool) {
-        // macOS does not expose automaticallyAdjustsVideoHDREnabled or isVideoHDREnabled.
-        // HDR on macOS is achieved through the photo output pipeline:
+    private func configureHSDR(device: AVCaptureDevice, enabled: Bool) {
+        // macOS does not expose automaticallyAdjustsVideoHSDREnabled or isVideoHSDREnabled.
+        // HSDR on macOS is achieved through the photo output pipeline:
         //   - maxPhotoQualityPrioritization = .quality for best tone mapping
         //   - High-resolution capture for maximum detail
-        // The actual HDR capture settings are applied per-shot in capturePhoto().
+        // The actual HSDR capture settings are applied per-shot in capturePhoto().
         if enabled {
             if #available(macOS 13.0, *) {
                 photoOutput.maxPhotoQualityPrioritization = .quality
@@ -751,6 +928,21 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
         didFinishProcessingPhoto photo: AVCapturePhoto,
         error: Error?
     ) {
+        // HSDR: single capture → virtual brackets → luminance mask blend
+        if isCapturingHSDR {
+            isCapturingHSDR = false
+            if error == nil,
+               let data = photo.fileDataRepresentation(),
+               let nsImage = NSImage(data: data),
+               let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                processHSDR(cgImage)
+            } else {
+                failHSDR()
+            }
+            return
+        }
+
+        // Normal photo capture
         let shouldMirror = mirrorAtCapture
 
         defer {
@@ -893,6 +1085,139 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
 
     func clearDetectedQR() {
         detectedQRString = nil
+    }
+}
+
+// MARK: - Image EXIF Metadata
+
+extension CameraManager {
+
+    func buildImageMetadata() -> [String: Any] {
+        var metadata: [String: Any] = [:]
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+        let dateStr = formatter.string(from: Date())
+
+        // TIFF
+        var tiff: [String: Any] = [:]
+        if exifCamera, let device = videoInput?.device {
+            tiff[kCGImagePropertyTIFFMake as String] = cameraManufacturer(for: device)
+            tiff[kCGImagePropertyTIFFModel as String] = device.localizedName
+        }
+        if exifSoftware {
+            tiff[kCGImagePropertyTIFFSoftware as String] = "Camera 1.0"
+        }
+        if exifDateTime {
+            tiff[kCGImagePropertyTIFFDateTime as String] = dateStr
+        }
+        if !tiff.isEmpty {
+            metadata[kCGImagePropertyTIFFDictionary as String] = tiff
+        }
+
+        // EXIF
+        var exif: [String: Any] = [:]
+        if exifDateTime {
+            exif[kCGImagePropertyExifDateTimeOriginal as String] = dateStr
+            exif[kCGImagePropertyExifDateTimeDigitized as String] = dateStr
+        }
+        if exifLens, let device = videoInput?.device {
+            exif[kCGImagePropertyExifLensMake as String] = cameraManufacturer(for: device)
+            exif[kCGImagePropertyExifLensModel as String] = device.localizedName
+        }
+        if !exif.isEmpty {
+            metadata[kCGImagePropertyExifDictionary as String] = exif
+        }
+
+        // GPS
+        if exifLocation, let location = currentLocation {
+            var gps: [String: Any] = [:]
+            let coord = location.coordinate
+            gps[kCGImagePropertyGPSLatitude as String] = abs(coord.latitude)
+            gps[kCGImagePropertyGPSLatitudeRef as String] = coord.latitude >= 0 ? "N" : "S"
+            gps[kCGImagePropertyGPSLongitude as String] = abs(coord.longitude)
+            gps[kCGImagePropertyGPSLongitudeRef as String] = coord.longitude >= 0 ? "E" : "W"
+            gps[kCGImagePropertyGPSAltitude as String] = abs(location.altitude)
+            gps[kCGImagePropertyGPSAltitudeRef as String] = location.altitude >= 0 ? 0 : 1
+
+            let utc = DateFormatter()
+            utc.timeZone = TimeZone(identifier: "UTC")
+            utc.dateFormat = "HH:mm:ss"
+            gps[kCGImagePropertyGPSTimeStamp as String] = utc.string(from: Date())
+            utc.dateFormat = "yyyy:MM:dd"
+            gps[kCGImagePropertyGPSDateStamp as String] = utc.string(from: Date())
+
+            metadata[kCGImagePropertyGPSDictionary as String] = gps
+        }
+
+        return metadata
+    }
+
+    func buildVideoMetadata() -> [AVMetadataItem] {
+        var items: [AVMetadataItem] = []
+
+        if exifCamera, let device = videoInput?.device {
+            let make = AVMutableMetadataItem()
+            make.identifier = .commonIdentifierMake
+            make.value = cameraManufacturer(for: device) as NSString
+            items.append(make)
+
+            let model = AVMutableMetadataItem()
+            model.identifier = .commonIdentifierModel
+            model.value = device.localizedName as NSString
+            items.append(model)
+        }
+
+        if exifSoftware {
+            let software = AVMutableMetadataItem()
+            software.identifier = .commonIdentifierSoftware
+            software.value = "Camera 1.0" as NSString
+            items.append(software)
+        }
+
+        if exifLocation, let loc = currentLocation {
+            let location = AVMutableMetadataItem()
+            location.identifier = .commonIdentifierLocation
+            let lat = loc.coordinate.latitude
+            let lon = loc.coordinate.longitude
+            let alt = loc.altitude
+            location.value = String(format: "%+09.5f%+010.5f%+.0f/", lat, lon, alt) as NSString
+            items.append(location)
+        }
+
+        if exifDateTime {
+            let date = AVMutableMetadataItem()
+            date.identifier = .commonIdentifierCreationDate
+            date.value = ISO8601DateFormatter().string(from: Date()) as NSString
+            items.append(date)
+        }
+
+        return items
+    }
+
+    private func cameraManufacturer(for device: AVCaptureDevice) -> String {
+        if !isExternal(device) { return "Apple" }
+        let id = device.modelID.lowercased()
+        if id.contains("apple") { return "Apple" }
+        if id.contains("logitech") { return "Logitech" }
+        return "Camera"
+    }
+}
+
+// MARK: - CLLocationManagerDelegate
+
+extension CameraManager: CLLocationManagerDelegate {
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        switch manager.authorizationStatus {
+        case .authorized, .authorizedAlways:
+            manager.startUpdatingLocation()
+        default:
+            break
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        currentLocation = locations.last
     }
 }
 
